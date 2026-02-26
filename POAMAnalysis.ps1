@@ -63,13 +63,21 @@
 
 $now = Get-Date -Format 'yyyyMMdd-HHmm'
 
+# Load Windows Forms assembly (ISE loads this automatically; console PowerShell does not)
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
 # File picker for Excel input file
 $OpenFileDialog = New-Object System.Windows.Forms.OpenFileDialog
 $OpenFileDialog.Title = "Select Excel Input File"
 $OpenFileDialog.Filter = "Excel Files (*.xlsx;*.xls)|*.xlsx;*.xls|All Files (*.*)|*.*"
 $OpenFileDialog.InitialDirectory = [Environment]::GetFolderPath("MyDocuments")
 
-if ($OpenFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+# Create a hidden top-most form to own the dialogs (forces them to foreground in console PS)
+$topForm = New-Object System.Windows.Forms.Form
+$topForm.TopMost = $true
+
+if ($OpenFileDialog.ShowDialog($topForm) -eq [System.Windows.Forms.DialogResult]::OK) {
     $ExcelFilePath = $OpenFileDialog.FileName
     Write-Host "Selected input file: $ExcelFilePath" -ForegroundColor Green
 } else {
@@ -85,13 +93,15 @@ $SaveFileDialog.DefaultExt = "docx"
 $SaveFileDialog.InitialDirectory = [Environment]::GetFolderPath("MyDocuments")
 $SaveFileDialog.FileName = "$now-POAMAnalysis.docx"
 
-if ($SaveFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+if ($SaveFileDialog.ShowDialog($topForm) -eq [System.Windows.Forms.DialogResult]::OK) {
     $OutputFilePath = $SaveFileDialog.FileName
     Write-Host "Selected output file: $OutputFilePath" -ForegroundColor Green
 } else {
     Write-Host "No output file selected. Exiting." -ForegroundColor Yellow
     exit
 }
+
+$topForm.Dispose()
 
 # Static prompt with current date embedded
 $StaticPrompt = @"
