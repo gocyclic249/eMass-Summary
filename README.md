@@ -34,7 +34,7 @@ This PowerShell script extracts POA&M data from Excel files exported from eMass 
 
 ### 1. Obtain API Key
 
-1. Navigate to Settings in [Ask Sage](https://api.genai.army.mil)
+1. Navigate to Settings in [Ask Sage](https://chat.genai.army.mil)
 2. Switch to the **Account** tab
 3. Scroll down to "Manage your API Keys" in the sidebar
 4. Click to generate your new API key
