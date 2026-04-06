@@ -63,6 +63,21 @@
 
 $now = Get-Date -Format 'yyyyMMdd-HHmm'
 
+# ── Bitness guard ──────────────────────────────────────────────────────────────
+# AF/DoD Microsoft 365 is nearly always 32-bit. When this script runs under
+# 64-bit PowerShell the Excel COM type library can't load and throws:
+#   TYPE_E_CANTLOADLIBRARY (0x80029C4A)
+# Fix: detect 64-bit host and re-launch transparently under 32-bit PowerShell.
+if ([System.IntPtr]::Size -eq 8) {
+    $wow64PS = "$env:WINDIR\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+    if (Test-Path $wow64PS) {
+        Write-Host "64-bit PowerShell detected — relaunching as 32-bit for Office COM compatibility..." -ForegroundColor Yellow
+        Start-Process $wow64PS -ArgumentList "-File `"$PSCommandPath`"" -Wait
+        exit
+    }
+}
+# ──────────────────────────────────────────────────────────────────────────────
+
 # Load Windows Forms assembly (ISE loads this automatically; console PowerShell does not)
 Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.Application]::EnableVisualStyles()
