@@ -326,77 +326,142 @@ function Add-ContentToWord {
     }
 }
 
+# ── Open XML XLSX reader (no Excel COM required) ──────────────────────────────
+# Reads .xlsx files directly as ZIP archives using built-in .NET types.
+# Eliminates dependency on Excel COM automation and the TYPE_E_CANTLOADLIBRARY
+# error caused by Office bitness mismatches or broken COM registrations.
+function Read-XlsxData {
+    param(
+        [string]$FilePath,
+        [string[]]$Fields
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+    try {
+        # Shared string table (most cell text is stored here by reference)
+        $ss = @()
+        $ssEntry = $zip.Entries | Where-Object { $_.FullName -eq 'xl/sharedStrings.xml' }
+        if ($ssEntry) {
+            $sr = New-Object System.IO.StreamReader($ssEntry.Open())
+            [xml]$ssXml = $sr.ReadToEnd(); $sr.Close()
+            $ss = @($ssXml.sst.si | ForEach-Object {
+                if ($null -ne $_.t) {
+                    if ($_.t -is [System.Xml.XmlElement]) { $_.t.InnerText } else { [string]$_.t }
+                } elseif ($null -ne $_.r) {
+                    (@($_.r) | ForEach-Object {
+                        if ($_.t -is [System.Xml.XmlElement]) { $_.t.InnerText } else { [string]$_.t }
+                    }) -join ''
+                } else { '' }
+            })
+        }
+
+        # Sheet 1 XML
+        $sheetEntry = $zip.Entries | Where-Object { $_.FullName -eq 'xl/worksheets/sheet1.xml' }
+        if (-not $sheetEntry) { throw "xl/worksheets/sheet1.xml not found — is this a valid .xlsx file?" }
+        $sr = New-Object System.IO.StreamReader($sheetEntry.Open())
+        [xml]$sx = $sr.ReadToEnd(); $sr.Close()
+
+        # Column letters -> 1-based index (A=1, Z=26, AA=27 …)
+        $colNumCache = @{}
+        function Get-ColNum([string]$letters) {
+            if ($colNumCache.ContainsKey($letters)) { return $colNumCache[$letters] }
+            $n = 0
+            foreach ($ch in $letters.ToUpper().ToCharArray()) { $n = $n * 26 + ([int][char]$ch - 64) }
+            $colNumCache[$letters] = $n; $n
+        }
+
+        # Convert Excel date serial -> DD-MMM-YYYY when applicable
+        $dateFields = 'Scheduled Completion Date','Completion Date','Risk Accepted Date'
+        function Convert-ExcelDate([string]$v) {
+            if ($v -match '^\d{4,5}$') {
+                $serial = [int]$v
+                if ($serial -gt 1 -and $serial -lt 55000) {
+                    try { return ([datetime]'1899-12-30').AddDays($serial).ToString('dd-MMM-yyyy') } catch {}
+                }
+            }
+            return $v
+        }
+
+        # Build a row-number -> { colIndex -> value } lookup
+        $grid = @{}
+        foreach ($row in $sx.worksheet.sheetData.row) {
+            $ri = [int]$row.r
+            $cells = @{}
+            foreach ($c in $row.c) {
+                if ($c.r -match '^([A-Z]+)\d+$') {
+                    $ci = Get-ColNum $Matches[1]
+                    $val = if ($c.t -eq 's' -and $null -ne $c.v) {
+                        $ss[[int]$c.v]
+                    } elseif ($c.t -eq 'inlineStr') {
+                        if ($null -ne $c.is) { [string]$c.is.t } else { '' }
+                    } elseif ($null -ne $c.v) { [string]$c.v } else { '' }
+                    $cells[$ci] = [string]$val
+                }
+            }
+            $grid[$ri] = $cells
+        }
+
+        # Row 3 is the header (rows 1-2 are eMass boilerplate)
+        $headerRow = $grid[3]
+        if (-not $headerRow) { throw "Header row not found at row 3. Check that this is an eMass Executive Report export." }
+
+        $colToField = @{}
+        foreach ($ci in $headerRow.Keys) {
+            if ($Fields -contains $headerRow[$ci]) { $colToField[$ci] = $headerRow[$ci] }
+        }
+
+        Write-Host "Header mapping: found $($colToField.Count) of $($Fields.Count) essential fields" -ForegroundColor Green
+
+        $maxRow = ($grid.Keys | Measure-Object -Maximum).Maximum
+        $results = [System.Collections.Generic.List[hashtable]]::new()
+
+        for ($r = 4; $r -le $maxRow; $r++) {
+            $cells = $grid[$r]
+            if (-not $cells) { continue }
+
+            $obj = @{}
+            $hasData = $false
+            foreach ($f in $Fields) { $obj[$f] = '' }
+
+            foreach ($ci in $colToField.Keys) {
+                $fname = $colToField[$ci]
+                $val = if ($cells.ContainsKey($ci)) { $cells[$ci] } else { '' }
+                if ($dateFields -contains $fname) { $val = Convert-ExcelDate $val }
+                $obj[$fname] = $val
+                if ($val -ne '') { $hasData = $true }
+            }
+
+            if ($hasData) { $results.Add($obj) }
+
+            if ($r % 10 -eq 0) {
+                Write-Host "  Processed $($r - 3) of $($maxRow - 3) rows..." -ForegroundColor Gray
+            }
+        }
+
+        return $results
+    }
+    finally {
+        $zip.Dispose()
+    }
+}
+# ──────────────────────────────────────────────────────────────────────────────
+
 # Load and process Excel file
-$excel = $null
-$workbook = $null
-$worksheet = $null
 $word = $null
 $doc = $null
 $selection = $null
 
 try {
-    Write-Host "`nLoading Excel file..." -ForegroundColor Cyan
-    $excel = New-Object -ComObject Excel.Application
-    $excel.Visible = $false
-    $excel.DisplayAlerts = $false
-    $workbook = $excel.Workbooks.Open($ExcelFilePath)
-    $worksheet = $workbook.Worksheets.Item(1)
-    
-    # Delete first two unwanted rows
-    Write-Host "Removing unwanted header rows..." -ForegroundColor Cyan
-    [void]$worksheet.Rows("1:2").Delete()
-    
-    # Now row 1 is the header row
-    $lastRow = $worksheet.UsedRange.Rows.Count
-    $lastCol = $worksheet.UsedRange.Columns.Count
-    
-    Write-Host "Found $($lastRow - 1) data rows and $lastCol columns" -ForegroundColor Green
-    
-    # Extract headers from row 1 and map to column indices
-    $headerMap = @{}
-    for ($col = 1; $col -le $lastCol; $col++) {
-        $headerValue = $worksheet.Cells.Item(1, $col).Text
-        if (-not [string]::IsNullOrWhiteSpace($headerValue)) {
-            $headerMap[$headerValue] = $col
-        }
+    Write-Host "`nLoading Excel file (Open XML — no Office COM required)..." -ForegroundColor Cyan
+
+    if ($ExcelFilePath -notmatch '\.xlsx$') {
+        throw "Only .xlsx files are supported. Please save your eMass export as .xlsx and retry."
     }
-    
-    Write-Host "Header mapping created for $($headerMap.Count) columns" -ForegroundColor Green
-    
-    # Build array of row objects with ONLY essential fields
-    $allRows = @()
-    Write-Host "Extracting essential data from Excel..." -ForegroundColor Cyan
-    
-    for ($row = 2; $row -le $lastRow; $row++) {
-        $rowObject = @{}
-        $hasData = $false
-        
-        # Only extract the essential fields
-        foreach ($fieldName in $essentialFields) {
-            if ($headerMap.ContainsKey($fieldName)) {
-                $colIndex = $headerMap[$fieldName]
-                $cellValue = $worksheet.Cells.Item($row, $colIndex).Text
-                $rowObject[$fieldName] = $cellValue
-                
-                if (-not [string]::IsNullOrWhiteSpace($cellValue)) {
-                    $hasData = $true
-                }
-            } else {
-                $rowObject[$fieldName] = ""
-            }
-        }
-        
-        # Only add rows with data
-        if ($hasData) {
-            $allRows += $rowObject
-        }
-        
-        # Progress indicator
-        if ($row % 10 -eq 0) {
-            Write-Host "  Processed $($row - 1) of $($lastRow - 1) rows..." -ForegroundColor Gray
-        }
-    }
-    
+
+    $allRows = Read-XlsxData -FilePath $ExcelFilePath -Fields $essentialFields
+
     Write-Host "Extracted $($allRows.Count) data rows (essential fields only)" -ForegroundColor Green
     
     # ====================================
@@ -547,15 +612,6 @@ finally {
     if ($selection) {
         [System.Runtime.InteropServices.Marshal]::ReleaseComObject($selection) | Out-Null
     }
-    if ($workbook) {
-        $workbook.Close($false)
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) | Out-Null
-    }
-    if ($excel) {
-        $excel.Quit()
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
-    }
-    
     [System.GC]::Collect()
     [System.GC]::WaitForPendingFinalizers()
     Write-Host "Complete!" -ForegroundColor Green
