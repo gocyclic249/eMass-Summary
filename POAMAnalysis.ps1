@@ -257,74 +257,106 @@ function Invoke-GenAIBatch {
     }
 }
 
-# Function to write content directly to Word document
-function Add-ContentToWord {
+# ── OOXML Word Writer (no Word COM required) ──────────────────────────────────
+# Builds a valid .docx by writing Open XML directly into a ZIP archive.
+# No Word COM, no Office installation required.
+
+$script:docxParagraphs = [System.Collections.Generic.List[string]]::new()
+
+function script:xe([string]$s) {
+    # XML-escape a string for embedding in element content
+    $s = $s -replace '&','&amp;'
+    $s = $s -replace '<','&lt;'
+    $s = $s -replace '>','&gt;'
+    $s = $s -replace '"','&quot;'
+    return $s
+}
+
+function script:New-WRun {
     param(
-        [object]$Selection,
-        [string]$Content
+        [string]$Text,
+        [bool]$Bold = $false,
+        [string]$ColorHex = '000000',   # RRGGBB, no leading #
+        [int]$SizePt = 11
     )
-    
-    # Split content into paragraphs
-    $paragraphs = $Content -split "`n"
-    
-    foreach ($para in $paragraphs) {
+    $escaped = xe $Text
+    $sz = $SizePt * 2   # OOXML uses half-points
+    $b  = if ($Bold) { '<w:b/><w:bCs/>' } else { '' }
+    return "<w:r><w:rPr>$b<w:color w:val=`"$ColorHex`"/><w:sz w:val=`"$sz`"/><w:szCs w:val=`"$sz`"/></w:rPr><w:t xml:space=`"preserve`">$escaped</w:t></w:r>"
+}
+
+function script:Add-WParagraph {
+    param(
+        [string]$Alignment = 'left',    # left | center
+        [string[]]$Runs = @()
+    )
+    $ppr = if ($Alignment -eq 'center') { '<w:pPr><w:jc w:val="center"/></w:pPr>' } else { '' }
+    $script:docxParagraphs.Add("<w:p>$ppr$($Runs -join '')</w:p>")
+}
+
+function script:Save-Docx {
+    param([string]$Path)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $body   = $script:docxParagraphs -join "`n"
+    $wns    = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    $docXml = "<?xml version=`"1.0`" encoding=`"UTF-8`" standalone=`"yes`"?>`n<w:document $wns><w:body>`n$body`n<w:sectPr/></w:body></w:document>"
+
+    $ct   = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'
+    $rels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>'
+    $wrel = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'
+
+    if (Test-Path $Path) { Remove-Item $Path -Force }
+    $zip = [System.IO.Compression.ZipFile]::Open($Path, 'Create')
+    try {
+        foreach ($pair in @(
+            @('[Content_Types].xml', $ct),
+            @('_rels/.rels',         $rels),
+            @('word/document.xml',   $docXml),
+            @('word/_rels/document.xml.rels', $wrel)
+        )) {
+            $entry  = $zip.CreateEntry($pair[0])
+            $writer = New-Object System.IO.StreamWriter($entry.Open(), (New-Object System.Text.UTF8Encoding($false)))
+            $writer.Write($pair[1])
+            $writer.Close()
+        }
+    } finally { $zip.Dispose() }
+}
+
+# Parse an AI response block and append paragraphs to $script:docxParagraphs
+function Add-ContentToDocx {
+    param([string]$Content)
+
+    foreach ($para in ($Content -split "`n")) {
         if ([string]::IsNullOrWhiteSpace($para)) {
-            $Selection.TypeParagraph()
-            continue
+            Add-WParagraph; continue
         }
-        
-        $trimmedPara = $para.Trim()
-        
-        # Detect POA&M record separators
-        if ($trimmedPara -match '^---+$') {
-            $Selection.TypeText("_" * 80)
-            $Selection.TypeParagraph()
+        $p = $para.Trim()
+
+        if ($p -match '^---+$') {
+            Add-WParagraph -Runs @(New-WRun ('_' * 80))
         }
-        # Detect POA&M ID lines (for emphasis)
-        elseif ($trimmedPara -match '^POA&M ID:') {
-            $Selection.Font.Size = 12
-            $Selection.Font.Bold = $true
-            $Selection.Font.Color = 31  # Dark blue
-            $Selection.TypeText($trimmedPara)
-            $Selection.TypeParagraph()
-            $Selection.Font.Size = 11
-            $Selection.Font.Bold = $false
-            $Selection.Font.Color = 0
+        elseif ($p -match '^POA&M ID:') {
+            Add-WParagraph -Runs @(New-WRun $p -Bold $true -ColorHex '1F3864' -SizePt 12)
         }
-        # Detect field labels (text followed by colon)
-        elseif ($trimmedPara -match '^([^:]+):\s*(.*)$') {
-            $label = $Matches[1]
-            $value = $Matches[2]
-            
-            # Color code based on priority/severity
-            $labelColor = 0  # Default black
-            if ($label -match 'Severity' -and $value -match 'CAT I') {
-                $labelColor = 255  # Red for CAT I
-            }
-            elseif ($label -match 'Risk Priority' -and $value -match 'Critical') {
-                $labelColor = 255  # Red for Critical
-            }
-            elseif ($label -match 'Risk Priority' -and $value -match 'High') {
-                $labelColor = 0x0000FF  # Orange
-            }
-            
-            $Selection.Font.Bold = $true
-            $Selection.Font.Color = $labelColor
-            $Selection.TypeText("$label`: ")
-            $Selection.Font.Bold = $false
-            $Selection.Font.Color = 0  # Black for value
+        elseif ($p -match '^([^:]+):\s*(.*)$') {
+            $label = $Matches[1]; $value = $Matches[2]
+            $color = '000000'
+            if ($label -match 'Severity'     -and $value -match 'CAT I')    { $color = 'FF0000' }
+            elseif ($label -match 'Risk Priority' -and $value -match 'Critical') { $color = 'FF0000' }
+            elseif ($label -match 'Risk Priority' -and $value -match 'High')     { $color = 'FF8C00' }
+            $runs = @(New-WRun "$label`: " -Bold $true -ColorHex $color)
             if (-not [string]::IsNullOrWhiteSpace($value)) {
-                $Selection.TypeText($value)
+                $runs += New-WRun $value
             }
-            $Selection.TypeParagraph()
+            Add-WParagraph -Runs $runs
         }
-        # Regular paragraph
         else {
-            $Selection.TypeText($trimmedPara)
-            $Selection.TypeParagraph()
+            Add-WParagraph -Runs @(New-WRun $p)
         }
     }
 }
+# ──────────────────────────────────────────────────────────────────────────────
 
 # ── Open XML XLSX reader (no Excel COM required) ──────────────────────────────
 # Reads .xlsx files directly as ZIP archives using built-in .NET types.
@@ -448,11 +480,6 @@ function Read-XlsxData {
 }
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Load and process Excel file
-$word = $null
-$doc = $null
-$selection = $null
-
 try {
     Write-Host "`nLoading Excel file (Open XML — no Office COM required)..." -ForegroundColor Cyan
 
@@ -465,126 +492,63 @@ try {
     Write-Host "Extracted $($allRows.Count) data rows (essential fields only)" -ForegroundColor Green
     
     # ====================================
-    # INITIALIZE WORD DOCUMENT
+    # BUILD DOCUMENT HEADER (OOXML)
     # ====================================
-    
-    Write-Host "`nInitializing Word document..." -ForegroundColor Cyan
-    $word = New-Object -ComObject Word.Application
-    $word.Visible = $false
-    $doc = $word.Documents.Add()
-    $selection = $word.Selection
-    Write-Host "Word document created" -ForegroundColor Green
-    
-    # ====================================
-    # DOCUMENT HEADER
-    # ====================================
-    
-    Write-Host "Adding document header..." -ForegroundColor Cyan
-    
-    # Add classification marking at top
-    $selection.Font.Size = 12
-    $selection.Font.Bold = $true
-    $selection.Font.Color = 255  # Red
-    $selection.ParagraphFormat.Alignment = 1  # Center
-    $selection.TypeText("CUI")
-    $selection.TypeParagraph()
-    $selection.TypeParagraph()
-    
-    # Add title
-    $selection.Font.Size = 16
-    $selection.Font.Bold = $true
-    $selection.Font.Color = 0  # Black
-    $selection.TypeText("FRCS POA&M Analysis Report")
-    $selection.TypeParagraph()
-    
-    # Add date
-    $selection.Font.Size = 11
-    $selection.Font.Bold = $false
-    $selection.TypeText("Generated: $now")
-    $selection.TypeParagraph()
-    $selection.TypeParagraph()
-    
-    # Reset formatting for body
-    $selection.Font.Size = 11
-    $selection.Font.Bold = $false
-    $selection.Font.Color = 0  # Black
-    $selection.ParagraphFormat.Alignment = 0  # Left
-    
+
+    Write-Host "`nBuilding document (Open XML — no Word COM required)..." -ForegroundColor Cyan
+    $script:docxParagraphs.Clear()
+
+    # CUI classification marking
+    Add-WParagraph -Alignment center -Runs @(New-WRun 'CUI' -Bold $true -ColorHex 'FF0000' -SizePt 12)
+    Add-WParagraph
+    # Title
+    Add-WParagraph -Alignment center -Runs @(New-WRun 'FRCS POA&M Analysis Report' -Bold $true -SizePt 16)
+    # Date
+    Add-WParagraph -Alignment center -Runs @(New-WRun "Generated: $now" -SizePt 11)
+    Add-WParagraph
     Write-Host "Document header complete" -ForegroundColor Green
-    
+
     # ====================================
-    # PROCESS BATCHES AND WRITE TO WORD
+    # PROCESS BATCHES AND WRITE TO DOCX
     # ====================================
-    
-    $batchSize = 1 #This is all that works for now
+
+    $batchSize = 1  # One record per API call
     $totalBatches = [Math]::Ceiling($allRows.Count / $batchSize)
-    
+
     Write-Host "`nProcessing $($allRows.Count) rows in $totalBatches batches (batch size: $batchSize)..." -ForegroundColor Yellow
-    
-    # Process in batches
+
     $successfulBatches = 0
     for ($i = 0; $i -lt $allRows.Count; $i += $batchSize) {
         $batchNumber = [Math]::Floor($i / $batchSize) + 1
-        $endIndex = [Math]::Min($i + $batchSize - 1, $allRows.Count - 1)
-        $batch = $allRows[$i..$endIndex]
-        
+        $endIndex    = [Math]::Min($i + $batchSize - 1, $allRows.Count - 1)
+        $batch       = $allRows[$i..$endIndex]
+
         Write-Host "`n--- Batch $batchNumber of $totalBatches (rows $($i + 1) to $($endIndex + 1)) ---" -ForegroundColor Yellow
-        
+
         $result = Invoke-GenAIBatch -Rows $batch -BatchNumber $batchNumber -TotalBatches $totalBatches
-        
+
         if ($result) {
             $successfulBatches++
-            Write-Host "  Writing to Word document..." -ForegroundColor Cyan
-            Add-ContentToWord -Selection $selection -Content $result
-            $selection.TypeParagraph()
-            Write-Host "  Content added to Word document" -ForegroundColor Green
+            Write-Host "  Writing to document..." -ForegroundColor Cyan
+            Add-ContentToDocx -Content $result
+            Add-WParagraph
+            Write-Host "  Content added to document" -ForegroundColor Green
         } else {
             Write-Host "  Batch $batchNumber failed - continuing with next batch..." -ForegroundColor Red
         }
-        
-        # Rate limiting - wait between batches
+
         if ($batchNumber -lt $totalBatches) {
             Write-Host "  Waiting 3 seconds before next batch..." -ForegroundColor Gray
             Start-Sleep -Seconds 3
         }
     }
-    
-    # ====================================
-    # DOCUMENT FOOTER
-    # ====================================
-    
-    Write-Host "`nAdding document footer..." -ForegroundColor Cyan
-    
-    # Add page numbers
-    $word.ActiveWindow.ActivePane.View.SeekView = 4  # wdSeekCurrentPageFooter
-    $selection.ParagraphFormat.Alignment = 1  # Center
-    
-    # Add classification marking in footer
-    $selection.Font.Size = 10
-    $selection.Font.Bold = $true
-    $selection.Font.Color = 255  # Red
-    $selection.TypeText("CUI")
-    $selection.TypeParagraph()
-    
-    # Add page numbers
-    $selection.Font.Size = 10
-    $selection.Font.Bold = $false
-    $selection.Font.Color = 0  # Black
-    $selection.TypeText("Page ")
-    $selection.Fields.Add($selection.Range, 33) | Out-Null  # wdFieldPage
-    $selection.TypeText(" of ")
-    $selection.Fields.Add($selection.Range, 34) | Out-Null  # wdFieldNumPages
-    
-    $word.ActiveWindow.ActivePane.View.SeekView = 0  # wdSeekMainDocument
-    
-    Write-Host "Document footer complete" -ForegroundColor Green
-    
+
     # ====================================
     # SAVE DOCUMENT
     # ====================================
-    
+
     Write-Host "`nSaving Word document..." -ForegroundColor Cyan
-    $doc.SaveAs([ref]$OutputFilePath, [ref]16)
+    Save-Docx -Path $OutputFilePath
     Write-Host "Word document saved successfully" -ForegroundColor Green
     
     Write-Host "`n========================================" -ForegroundColor Green
@@ -598,21 +562,5 @@ catch {
     Write-Error $_.ScriptStackTrace
 }
 finally {
-    # Clean up COM objects
-    Write-Host "`nCleaning up..." -ForegroundColor Cyan
-    
-    if ($doc) {
-        $doc.Close()
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($doc) | Out-Null
-    }
-    if ($word) {
-        $word.Quit()
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null
-    }
-    if ($selection) {
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($selection) | Out-Null
-    }
-    [System.GC]::Collect()
-    [System.GC]::WaitForPendingFinalizers()
-    Write-Host "Complete!" -ForegroundColor Green
+    Write-Host "`nComplete!" -ForegroundColor Green
 }
